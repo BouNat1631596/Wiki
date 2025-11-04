@@ -1,0 +1,353 @@
+<?php
+
+// ============================================================================
+// ERREUR 1 - NIVEAU FACILE : Manque le declare(strict_types=1)
+// ============================================================================
+
+namespace App\Controller;
+
+use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\Routing\Annotation\Route;
+
+class UserController extends AbstractController
+{
+    #[Route('/user/{id}', name: 'user_show')]
+    public function show($id): Response
+    {
+        // ❌ PROBLÈME : 
+        // - Pas de declare(strict_types=1) en haut du fichier
+        // - Pas de type hint sur le paramètre $id
+        // - Logique métier directement dans le contrôleur
+        
+        $user = $this->getDoctrine()
+            ->getRepository(User::class)
+            ->find($id);
+        
+        return $this->render('user/show.html.twig', [
+            'user' => $user
+        ]);
+    }
+}
+
+
+// ============================================================================
+// ERREUR 2 - NIVEAU MOYEN : Injection de dépendance incorrecte
+// ============================================================================
+
+declare(strict_types=1);
+
+namespace App\Service;
+
+use Doctrine\ORM\EntityManagerInterface;
+
+class ProductService
+{
+    private EntityManagerInterface $entityManager;
+    
+    // ❌ PROBLÈME : Injection via le constructeur mais sans readonly (PHP 8.1+)
+    // et utilisation directe de l'EntityManager au lieu d'un Repository
+    public function __construct(EntityManagerInterface $entityManager)
+    {
+        $this->entityManager = $entityManager;
+    }
+    
+    public function createProduct(string $name, float $price): void
+    {
+        // ❌ PROBLÈME : Création manuelle d'entité sans validation
+        $product = new Product();
+        $product->setName($name);
+        $product->setPrice($price);
+        
+        // ❌ PROBLÈME : Pas de gestion d'erreur, pas de flush dans un try-catch
+        $this->entityManager->persist($product);
+        $this->entityManager->flush();
+    }
+}
+
+
+// ============================================================================
+// ERREUR 3 - NIVEAU MOYEN-DIFFICILE : Nesting profond et responsabilités mixtes
+// ============================================================================
+
+declare(strict_types=1);
+
+namespace App\Controller;
+
+use App\Entity\Order;
+use Doctrine\ORM\EntityManagerInterface;
+use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\Routing\Annotation\Route;
+
+class OrderController extends AbstractController
+{
+    #[Route('/order/process', name: 'order_process', methods: ['POST'])]
+    public function processOrder(Request $request, EntityManagerInterface $em): Response
+    {
+        // ❌ PROBLÈME : Nesting profond (plus de 3 niveaux)
+        // ❌ PROBLÈME : Logique métier dans le contrôleur
+        // ❌ PROBLÈME : Pas de validation CSRF
+        // ❌ PROBLÈME : Pas d'early return
+        
+        $data = $request->request->all();
+        
+        if (isset($data['items']) && count($data['items']) > 0) {
+            $order = new Order();
+            $order->setCreatedAt(new \DateTime());
+            
+            if (isset($data['customer_id'])) {
+                $customer = $em->getRepository(Customer::class)->find($data['customer_id']);
+                
+                if ($customer !== null) {
+                    $order->setCustomer($customer);
+                    $totalPrice = 0;
+                    
+                    foreach ($data['items'] as $item) {
+                        if (isset($item['product_id']) && isset($item['quantity'])) {
+                            $product = $em->getRepository(Product::class)->find($item['product_id']);
+                            
+                            if ($product !== null && $product->getStock() >= $item['quantity']) {
+                                $orderItem = new OrderItem();
+                                $orderItem->setProduct($product);
+                                $orderItem->setQuantity($item['quantity']);
+                                $orderItem->setPrice($product->getPrice());
+                                $order->addItem($orderItem);
+                                $totalPrice += $product->getPrice() * $item['quantity'];
+                                
+                                $product->setStock($product->getStock() - $item['quantity']);
+                            }
+                        }
+                    }
+                    
+                    $order->setTotalPrice($totalPrice);
+                    $em->persist($order);
+                    $em->flush();
+                    
+                    return $this->json(['success' => true, 'order_id' => $order->getId()]);
+                }
+            }
+        }
+        
+        return $this->json(['success' => false], 400);
+    }
+}
+
+
+// ============================================================================
+// ERREUR 4 - NIVEAU DIFFICILE : Race condition et problème de transaction
+// ============================================================================
+
+declare(strict_types=1);
+
+namespace App\Service;
+
+use App\Entity\Wallet;
+use Doctrine\ORM\EntityManagerInterface;
+
+class WalletService
+{
+    public function __construct(
+        private readonly EntityManagerInterface $entityManager
+    ) {}
+    
+    public function transfer(int $fromWalletId, int $toWalletId, float $amount): bool
+    {
+        // ❌ PROBLÈME SUBTIL : Race condition possible
+        // Si deux transferts se font en même temps depuis le même wallet,
+        // les deux peuvent lire le même solde avant qu'il soit mis à jour
+        
+        $fromWallet = $this->entityManager->find(Wallet::class, $fromWalletId);
+        $toWallet = $this->entityManager->find(Wallet::class, $toWalletId);
+        
+        if ($fromWallet === null || $toWallet === null) {
+            return false;
+        }
+        
+        // ❌ PROBLÈME : Pas de verrouillage pessimiste (LOCK IN SHARE MODE ou FOR UPDATE)
+        if ($fromWallet->getBalance() < $amount) {
+            return false;
+        }
+        
+        // ❌ PROBLÈME : Entre ces deux lignes, un autre process pourrait modifier le solde
+        $fromWallet->setBalance($fromWallet->getBalance() - $amount);
+        $toWallet->setBalance($toWallet->getBalance() + $amount);
+        
+        // ❌ PROBLÈME : Pas de transaction explicite
+        // Si le flush échoue après avoir débité mais avant d'avoir crédité,
+        // l'argent disparaît
+        $this->entityManager->flush();
+        
+        return true;
+    }
+    
+    // ✅ VERSION CORRECTE :
+    /*
+    public function transferSecure(int $fromWalletId, int $toWalletId, float $amount): bool
+    {
+        return $this->entityManager->wrapInTransaction(function() use ($fromWalletId, $toWalletId, $amount) {
+            // Verrouillage pessimiste pour éviter les race conditions
+            $fromWallet = $this->entityManager
+                ->createQuery('SELECT w FROM App\Entity\Wallet w WHERE w.id = :id')
+                ->setParameter('id', $fromWalletId)
+                ->setLockMode(LockMode::PESSIMISTIC_WRITE)
+                ->getSingleResult();
+                
+            $toWallet = $this->entityManager->find(Wallet::class, $toWalletId);
+            
+            if ($fromWallet === null || $toWallet === null || $fromWallet->getBalance() < $amount) {
+                throw new \RuntimeException('Transfer failed');
+            }
+            
+            $fromWallet->setBalance($fromWallet->getBalance() - $amount);
+            $toWallet->setBalance($toWallet->getBalance() + $amount);
+            
+            return true;
+        });
+    }
+    */
+}
+
+
+// ============================================================================
+// ERREUR 5 - NIVEAU TRÈS DIFFICILE : N+1 Query Problem caché + Memory Leak
+// ============================================================================
+
+declare(strict_types=1);
+
+namespace App\Service;
+
+use App\Entity\Article;
+use App\Repository\ArticleRepository;
+use Doctrine\ORM\EntityManagerInterface;
+
+class ArticleAnalyticService
+{
+    public function __construct(
+        private readonly ArticleRepository $articleRepository,
+        private readonly EntityManagerInterface $entityManager
+    ) {}
+    
+    public function generateMonthlyReport(): array
+    {
+        // ❌ PROBLÈME TRÈS SUBTIL : N+1 queries et memory leak
+        
+        // Récupère tous les articles (peut être 100 000+)
+        $articles = $this->articleRepository->findAll();
+        
+        $report = [];
+        
+        foreach ($articles as $article) {
+            // ❌ PROBLÈME 1 : N+1 Query
+            // Pour chaque article, Doctrine va faire une requête séparée
+            // pour charger les commentaires (lazy loading)
+            $commentCount = count($article->getComments());
+            
+            // ❌ PROBLÈME 2 : N+1 Query encore
+            // Pour chaque article, requête pour charger l'auteur
+            $authorName = $article->getAuthor()->getName();
+            
+            // ❌ PROBLÈME 3 : N+1 Query supplémentaire
+            // Pour chaque article, requête pour les tags
+            $tags = [];
+            foreach ($article->getTags() as $tag) {
+                $tags[] = $tag->getName();
+            }
+            
+            // ❌ PROBLÈME 4 : Memory Leak
+            // Les entités restent en mémoire, pas de clear()
+            // Avec 100 000 articles, PHP va manquer de mémoire
+            
+            $report[] = [
+                'title' => $article->getTitle(),
+                'author' => $authorName,
+                'comments' => $commentCount,
+                'tags' => $tags,
+                'views' => $article->getViews()
+            ];
+        }
+        
+        return $report;
+        
+        // ❌ RÉSULTAT : Au lieu de 1 requête, on a potentiellement :
+        // 1 (articles) + N (authors) + N (comments count) + N*M (tags) requêtes
+        // Pour 1000 articles avec 5 tags chacun = 1 + 1000 + 1000 + 5000 = 7001 requêtes !
+        // Et PHP crashe avec Out of Memory après ~10 000 articles
+    }
+    
+    // ✅ VERSION CORRECTE :
+    /*
+    public function generateMonthlyReportOptimized(): array
+    {
+        // Une seule requête avec tous les JOINs
+        $articles = $this->articleRepository->createQueryBuilder('a')
+            ->select('a, author, comments, tags')
+            ->leftJoin('a.author', 'author')
+            ->leftJoin('a.comments', 'comments')
+            ->leftJoin('a.tags', 'tags')
+            ->getQuery()
+            ->toIterable(); // Utilise un curseur pour ne pas tout charger en mémoire
+        
+        $report = [];
+        $batchSize = 100;
+        $i = 0;
+        
+        foreach ($articles as $article) {
+            $report[] = [
+                'title' => $article->getTitle(),
+                'author' => $article->getAuthor()->getName(),
+                'comments' => $article->getComments()->count(),
+                'tags' => array_map(fn($tag) => $tag->getName(), $article->getTags()->toArray()),
+                'views' => $article->getViews()
+            ];
+            
+            // Clear périodique pour éviter le memory leak
+            if (($i % $batchSize) === 0) {
+                $this->entityManager->clear();
+            }
+            ++$i;
+        }
+        
+        return $report;
+    }
+    */
+}
+
+
+// ============================================================================
+// RÉSUMÉ DES ERREURS PAR NIVEAU
+// ============================================================================
+
+/*
+NIVEAU 1 (FACILE) :
+- Pas de declare(strict_types=1)
+- Pas de type hints
+- Logique métier dans le contrôleur
+🔍 Détection : Lecture directe du code
+
+NIVEAU 2 (MOYEN) :
+- Injection sans readonly
+- Pas de gestion d'erreur sur flush()
+- Utilisation directe de l'EntityManager
+🔍 Détection : Connaissance des best practices Symfony
+
+NIVEAU 3 (MOYEN-DIFFICILE) :
+- Nesting profond (>3 niveaux)
+- Pas de validation CSRF
+- Pas d'early return
+- Logique métier complexe dans contrôleur
+🔍 Détection : Analyse de la structure du code
+
+NIVEAU 4 (DIFFICILE) :
+- Race condition
+- Pas de verrouillage de base de données
+- Pas de transaction explicite
+🔍 Détection : Nécessite de penser aux cas concurrents
+
+NIVEAU 5 (TRÈS DIFFICILE) :
+- N+1 queries cachées par lazy loading
+- Memory leak sur gros volumes
+- Performance catastrophique à l'échelle
+🔍 Détection : Tests de charge ou profiling nécessaire
+*/
